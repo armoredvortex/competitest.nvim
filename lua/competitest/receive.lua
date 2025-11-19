@@ -2,6 +2,10 @@ local luv = vim.uv and vim.uv or vim.loop
 local utils = require("competitest.utils")
 local M = {}
 local storage_utils = {}
+-- Payload used by CPH submit browser extension (polled via GET /getSubmit)
+M.submit_payload = {
+	empty = true,
+}
 
 ---@alias competitest.CCTask.batch_id string
 
@@ -48,16 +52,88 @@ function Receiver:new(address, port, callback)
 		assert(client, "CompetiTest.nvim: Receiver:new, server:listen: client TCP socket creation failed")
 		server:accept(client)
 		local message = {} -- received string
+
 		client:read_start(function(error, chunk)
 			assert(not error, error)
 			if chunk then
 				table.insert(message, chunk)
+
+				-- Try to process request as soon as we have headers (and body when Content-Length is present).
+				local raw = table.concat(message)
+				local headers_end = string.find(raw, "\r\n\r\n", 1, true)
+				if headers_end then
+					local headers = string.sub(raw, 1, headers_end)
+
+					-- Handle GET /getSubmit immediately (no body required)
+					local first_line_end = string.find(raw, "\r\n", 1, true) or 0
+					local request_line = string.sub(raw, 1, first_line_end)
+					if request_line:match("^GET /getSubmit") then
+						local body = vim.json.encode(M.submit_payload or { empty = true })
+						local response = "HTTP/1.1 200 OK\r\n" .. "Content-Type: application/json\r\n" .. "Content-Length: " .. #body .. "\r\n" .. "\r\n" .. body
+
+						client:write(response)
+						client:shutdown()
+						client:close()
+
+						-- reset so the next poll doesn't resubmit
+						M.submit_payload = { empty = true }
+						return
+					end
+
+					-- For other requests, check Content-Length to determine if body is complete
+					local content_length = tonumber(string.match(headers, "[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+					local body = string.sub(raw, headers_end + 4)
+					if content_length then
+						if #body >= content_length then
+							client:read_stop()
+							client:close()
+							local content = string.sub(body, 1, content_length)
+							if content and #content > 0 then
+								local ok, task = pcall(vim.json.decode, content)
+								if ok then
+									callback(task)
+								end
+							end
+						end
+					end
+					-- if no Content-Length header, keep reading until EOF (existing behaviour)
+				end
 			else
 				client:read_stop()
+
+				local raw = table.concat(message)
+
+				----------------------------------------------------------------------
+				-- HTTP GET /getSubmit (for CPH submit browser extension)
+				----------------------------------------------------------------------
+				if raw:match("^GET /getSubmit") then
+					local body = vim.json.encode(M.submit_payload or {
+						empty = true,
+					})
+					local response = "HTTP/1.1 200 OK\r\n" .. "Content-Type: application/json\r\n" .. "Content-Length: " .. #body .. "\r\n" .. "\r\n" .. body
+
+					client:write(response)
+					client:shutdown()
+					client:close()
+
+					-- reset so the next poll doesn't resubmit
+					M.submit_payload = {
+						empty = true,
+					}
+					return
+				end
+				----------------------------------------------------------------------
+				-- End /getSubmit handling
+				----------------------------------------------------------------------
+
 				client:close()
-				local content = string.match(table.concat(message), "^.+\r\n(.+)$") -- last line, text after last \r\n
-				local task = vim.json.decode(content)
-				callback(task)
+
+				-- Competitive Companion JSON: last line after headers
+				local content = string.match(raw, "^.+\r\n(.+)$")
+				if content then
+					local task = vim.json.decode(content)
+					callback(task)
+				end
 			end
 		end)
 	end)
@@ -103,7 +179,10 @@ end
 ---@param task competitest.CCTask
 function TasksCollector:insert(task)
 	if not self.batches[task.batch.id] then
-		self.batches[task.batch.id] = { size = task.batch.size, tasks = {} }
+		self.batches[task.batch.id] = {
+			size = task.batch.size,
+			tasks = {},
+		}
 	end
 	local b = self.batches[task.batch.id]
 	table.insert(b.tasks, task)
@@ -170,7 +249,7 @@ end
 
 ---------------- RECEIVE METHODS ----------------
 
----@alias competitest.ReceiveMode "testcases" | "problem" | "contest" | "persistently"
+---@alias competitest.ReceiveMode "testcases" | "problem" | "contest" | "persistently" | "submit"
 
 ---@class (exact) competitest.ReceiveStatus
 ---@field mode competitest.ReceiveMode
@@ -275,7 +354,15 @@ function M.start_receiving(mode, companion_port, notify_on_start, notify_on_rece
 				end
 			end
 		end
+	elseif mode == "submit" then
+		-- We only care about having the TCP server alive so that
+		-- GET /getSubmit works. Any Competitive Companion JSON that
+		-- arrives while in this mode is simply ignored.
+		bsp_callback = function(_, finished)
+			finished()
+		end
 	end
+
 	local batches_serial_processor = BatchesSerialProcessor:new(vim.schedule_wrap(bsp_callback))
 	local tasks_collector = TasksCollector:new(function(tasks)
 		batches_serial_processor:enqueue(tasks)

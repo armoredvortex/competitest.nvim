@@ -77,6 +77,12 @@ function M.command(arguments)
 				M.receive(args[2])
 			end
 		end,
+
+		submit = function()
+			if check_subargs(0, 0) then
+				M.submit()
+			end
+		end,
 	}
 
 	local sub = subcommands[args[1]]
@@ -311,5 +317,86 @@ function M.receive(mode)
 		utils.notify("receive: " .. error .. ".")
 	end
 end
+
+-------------------------------------------------------------------
+-- CF SUBMIT IMPLEMENTATION
+-------------------------------------------------------------------
+function M.submit()
+	local api = vim.api
+	local bufnr = api.nvim_get_current_buf()
+	local config = require("competitest.config")
+	local utils = require("competitest.utils")
+	local receive = require("competitest.receive")
+
+	config.load_buffer_config(bufnr)
+	local cfg = config.get_buffer_config(bufnr)
+
+	-- 1. read source
+	local lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+	local source = table.concat(lines, "\n")
+
+	-- 2. extract problem-url comment
+	local url = nil
+	for _, line in ipairs(lines) do
+		local m = line:match("//%s*problem%-url:%s*(%S+)")
+		if m then
+			url = m
+			break
+		end
+	end
+
+	if not url then
+		utils.notify("submit: missing '// problem-url: <url>' comment", "ERROR")
+		return
+	end
+
+	-- 3. get problem name (1927D)
+	local contest, index = url:match("/contest/(%d+)/problem/(%u+)")
+	if not contest then
+		local c2, i2 = url:match("/problemset/problem/(%d+)/(%u+)")
+		if c2 then
+			contest, index = c2, i2
+		end
+	end
+
+	local problemName = ""
+	if contest and index then
+		problemName = contest .. index
+	end
+
+	-- 4. language mapping
+	local ft = vim.bo[bufnr].filetype
+	local lang_map = {
+		cpp = 91,
+		c = 43,
+		python = 31,
+		java = 36,
+	}
+	local languageId = lang_map[ft]
+
+	if not languageId then
+		utils.notify("submit: unsupported filetype: " .. tostring(ft), "ERROR")
+		return
+	end
+
+	-- 5. store payload for GET /getSubmit
+	receive.submit_payload = {
+		empty = false,
+		url = url,
+		problemName = problemName,
+		sourceCode = source,
+		languageId = languageId,
+	}
+
+	-- 6. ensure server is running in submit mode
+	local err = receive.start_receiving("submit", cfg.companion_port, false, false, nil, cfg)
+	if err and err ~= "receiving already enabled, stop it if you want to change receive mode" then
+		utils.notify("submit: " .. err, "ERROR")
+		return
+	end
+
+	utils.notify("CFSubmit: waiting for browser to collect payload…", "INFO")
+end
+-------------------------------------------------------------------
 
 return M
